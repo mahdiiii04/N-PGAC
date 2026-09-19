@@ -6,12 +6,21 @@ import torch as th
 
 from algos.mappo.trainer import MAPPOConfig, MAPPOTrainer
 from algos.npgac.trainer import NPGACConfig, NPGACTrainer
-from envs.matrix_game import AlphaMatrixGameEnv
+from envs.matrix_game import (
+    COMMON_INTEREST_ALPHA,
+    AlphaMatrixGameEnv,
+    CommonInterestMatrixGameEnv,
+)
 from eval.ground_truth import ground_truth_pq, regime
 from eval.regret import regret
 
 
 ALPHAS = [
+    COMMON_INTEREST_ALPHA,  # -1: CommonInterestMatrixGameEnv, not part of
+                             # the alpha family -- the trust gate's upper-
+                             # bound sanity check (see envs/matrix_game.py).
+                             # Drop it via --alphas if you just want the
+                             # paper's own sweep.
     0.0, 0.1, 0.2,       # pure (A1, B1)
     0.25, 0.3, 0.33,     # pure (A1, B2)
     0.34, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,  # mixed
@@ -80,7 +89,10 @@ def run_algo(algo, alpha, seed, train_steps=None, log_every=None):
     log_every = LOG_EVERY if log_every is None else log_every
 
     th.manual_seed(seed)
-    env = AlphaMatrixGameEnv(alpha=alpha, batch_size=BATCH_SIZE)
+    if alpha == COMMON_INTEREST_ALPHA:
+        env = CommonInterestMatrixGameEnv(batch_size=BATCH_SIZE)
+    else:
+        env = AlphaMatrixGameEnv(alpha=alpha, batch_size=BATCH_SIZE)
     trainer_cls, config_cls = TRAINERS[algo]
     trainer = trainer_cls(env, config_cls())
     num_agents = config_cls().num_agents
@@ -220,10 +232,18 @@ def run_sweep(alphas=ALPHAS, seeds=SEEDS, algorithms=("npgac", "mappo"),
 
                 done += 1
                 elapsed = time.time() - start
+                # gt_p/gt_q are None for the common-interest sentinel (see
+                # ground_truth_pq's docstring: multiple valid NE, no single
+                # closed-form target), so the usual "(gt=(...))" suffix
+                # doesn't apply there.
+                gt_str = (
+                    f"(gt=({gt_p:.4f},{gt_q:.4f}))" if gt_p is not None
+                    else "(gt=multiple NE, common interest)"
+                )
                 print(
                     f"[{done}/{total}] {algo} alpha={alpha} seed={seed}: "
                     f"(p,q)=({p:.4f},{q:.4f}) regret={r_max:.4f} "
-                    f"(gt=({gt_p:.4f},{gt_q:.4f}))  [{elapsed:.0f}s elapsed]"
+                    f"{gt_str}  [{elapsed:.0f}s elapsed]"
                 )
 
     return results

@@ -28,6 +28,7 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 import numpy as np
 
+from envs.matrix_game import COMMON_INTEREST_ALPHA
 from eval.ground_truth import (
     ALPHA_BREAK_1,
     ALPHA_BREAK_2,
@@ -68,6 +69,50 @@ def load_and_aggregate(path):
             "n_seeds": len(cells),
         }
     return agg
+
+
+def split_common_interest(agg):
+    """agg, as returned by load_and_aggregate, mixes the alpha in [0, 1]
+    family with the COMMON_INTEREST_ALPHA (-1) sentinel cell(s) under one
+    dict. Returns (agg_alpha_family, agg_common_interest): the sentinel
+    can't sit on plot_strategy_curve/plot_regret_curve's 0..1 alpha axis
+    next to a ground-truth NE curve that isn't defined for it (see
+    eval.ground_truth.ground_truth_pq's docstring -- multiple valid NE,
+    no single target), so it must never reach those two functions. Use
+    agg_common_interest with print_common_interest_summary instead.
+    """
+    agg_alpha_family = defaultdict(dict)
+    agg_common_interest = defaultdict(dict)
+    for algo, by_alpha in agg.items():
+        for alpha, stats in by_alpha.items():
+            target = agg_common_interest if alpha == COMMON_INTEREST_ALPHA else agg_alpha_family
+            target[algo][alpha] = stats
+    return agg_alpha_family, agg_common_interest
+
+
+def print_common_interest_summary(agg_common_interest):
+    """Console summary (mean +/- std over seeds) for the common-interest
+    sentinel cell, analogous to what the alpha-vs-NE figure shows visually
+    for the rest of the sweep but has no plot of its own here -- the real
+    per-step signal for this cell (does lambda_i actually approach ~1) is
+    in the lambda/k_hat-vs-step figure that make_all_curve_figures already
+    produces for every alpha, sentinel included, via the existing
+    per-step-curve machinery below (nothing algo-specific needed there).
+    """
+    if not agg_common_interest:
+        return
+    print("\ncommon-interest sanity check (alpha = "
+          f"{COMMON_INTEREST_ALPHA:g}), final (p, q, regret), mean +/- std over seeds:")
+    for algo, by_alpha in agg_common_interest.items():
+        stats = by_alpha[COMMON_INTEREST_ALPHA]
+        print(
+            f"  {algo:6s}: p={stats['p_mean']:.4f}+/-{stats['p_std']:.4f}  "
+            f"q={stats['q_mean']:.4f}+/-{stats['q_std']:.4f}  "
+            f"regret={stats['regret_mean']:.4f}+/-{stats['regret_std']:.4f}  "
+            f"(n={stats['n_seeds']})"
+        )
+    print("  (see figures/lambda_khat_alpha=-1.png for whether lambda_i "
+          "actually approaches ~1 over training)")
 
 
 def plot_strategy_curve(agg, ax, coord, coord_label):
@@ -124,6 +169,18 @@ def plot_regret_curve(agg, ax):
 
 def make_figure(results_path, out_path):
     agg = load_and_aggregate(results_path)
+    agg, agg_common_interest = split_common_interest(agg)
+    print_common_interest_summary(agg_common_interest)
+
+    if not agg:
+        # e.g. a sweep run with only --alphas -1: nothing alpha-family to
+        # plot on this panel (its x-axis and ground-truth overlay don't
+        # apply to the common-interest sentinel -- see
+        # split_common_interest). Skip it rather than save an empty
+        # 3-panel figure with legend warnings for panels with no data.
+        print("no alpha-family (non-common-interest) results to plot "
+              f"the NE-curve summary from; skipping {out_path}")
+        return None
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
     plot_strategy_curve(agg, axes[0], "p", r"$p$ = P(player A plays A2)")
