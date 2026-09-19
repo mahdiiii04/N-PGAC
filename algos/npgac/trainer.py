@@ -20,8 +20,36 @@ class NPGACConfig:
     lr_phi: float = 1e-3
 
     beta: float = 5.0
-    k_max_fraction: float = 0.5
+
+    k_max_fraction: float = 1.5
+    # ^ was 0.5. AdaptiveKMax used to gate k_hat against a fraction of its
+    # OWN live, pooled-across-agents EMA -- once k_hat stabilized at any
+    # level v, that EMA -> v, so k_max -> k_max_fraction * v. With
+    # k_max_fraction < 1 this guaranteed k_hat/k_max > 1 (lambda -> 0) at
+    # ANY stable k_hat, independent of whether the game is actually
+    # near-potential -- see AdaptiveKMax's docstring in losses.py. Now
+    # that k_max is (a) per-agent, (b) calibrated once and frozen instead
+    # of chasing k_hat forever, and (c) compared against a
+    # perturbation-normalized k_hat that should roughly stabilize rather
+    # than decay, k_max_fraction instead means "how many multiples of the
+    # calibrated reference scale still count as trustworthy." Treat this
+    # default as a starting point to sweep, not a known-good value --
+    # after re-running, check that lambda/k_hat settle somewhere in (0, 1)
+    # for the near-potential alphas instead of saturating at 0 or 1.
     k_max_ema_decay: float = 0.99
+    k_max_calibration_steps: int = 200
+    # ^ new. Number of train_step()s over which each agent's k_max
+    # reference is estimated (an EMA of that agent's OWN k_hat, never
+    # pooled with the other agent's); frozen after this many updates. 200
+    # is chosen to sit early in the entropy_anneal_steps=1000 schedule
+    # (entropy_coef(200) ~= 0.025, vs. entropy_start=0.03), i.e. while the
+    # policy is still close to its initial exploration level, so the
+    # reference reflects genuine early disagreement rather than an
+    # already-sharpened policy.
+    phi_probe_eps: float = 1e-4
+    # ^ new. Floor added to the squared counterfactual perturbation when
+    # normalizing k_hat (see closeness_and_trsut), so the normalization
+    # doesn't blow up if a'_i - a_i is ~0 for a batch element.
 
     entropy_start: float = 0.03
     entropy_end: float = 0.003
@@ -72,8 +100,11 @@ class NPGACTrainer:
         self.phi_optim = th.optim.Adam(self.phi.parameters(), lr=self.cfg.lr_phi)
 
         self.k_max_tracker = AdaptiveKMax(
+            num_agents=N,
             k_max_fraction=self.cfg.k_max_fraction,
             ema_decay=self.cfg.k_max_ema_decay,
+            calibration_steps=self.cfg.k_max_calibration_steps,
+            device=self.device,
         )
 
         self.num_updates = 0
@@ -114,7 +145,7 @@ class NPGACTrainer:
 
         # Phi update
         td_loss = phi_td_loss(self.phi, td, N)
-        naive_loss, phi_residuals = phi_naive_loss(
+        naive_loss, phi_residuals, phi_deltas = phi_naive_loss(
             self.phi, self.q_heads, self.actors, td, N
         )
         phi_loss = td_loss + self.cfg.beta * naive_loss
@@ -133,17 +164,26 @@ class NPGACTrainer:
 
         # Actor update
         with th.no_grad():
-            _, fresh_residuals = phi_naive_loss(
+            _, fresh_residuals, fresh_deltas = phi_naive_loss(
                 self.phi, self.q_heads, self.actors, td, N
             )
 
-        k_hat_now, _ = closeness_and_trsut(fresh_residuals, self.k_max_tracker.k_max)
+        k_hat_now, _ = closeness_and_trsut(
+            fresh_residuals, fresh_deltas, self.k_max_tracker.k_max,
+            eps=self.cfg.phi_probe_eps,
+        )
         self.k_max_tracker.update(k_hat_now)
+        # ^ once, full [N] vector -- NOT looped/indexed per agent (e.g.
+        # `for i in range(N): self.k_max_tracker.update(k_hat_now[i])`).
+        # See AdaptiveKMax.update's docstring in losses.py for why that
+        # would break both the per-agent calibration and the calibration
+        # step count.
 
         current_entropy_coef = self.cfg.entropy_coef(self.num_updates)
         actor_out = actor_losses(
             self.actors, self.q_heads, self.phi, td, N, self.k_max_tracker.k_max,
-            phi_residuals=fresh_residuals, entropy_coef=current_entropy_coef,
+            phi_residuals=fresh_residuals, phi_deltas=fresh_deltas,
+            entropy_coef=current_entropy_coef,
         )
 
         for i in range(N):
@@ -158,8 +198,17 @@ class NPGACTrainer:
             log[f"actor/{i}/lambda"] = actor_out.lam[i].item()
             log[f"actor/{i}/k_hat"] = actor_out.k_hat[i].item()
             log[f"actor/{i}/entropy"] = actor_out.entropy[i].item()
+            log[f"actor/{i}/k_max"] = self.k_max_tracker.k_max[i].item()
+            log[f"actor/{i}/probe_delta_sq"] = (fresh_deltas[i] ** 2).mean().item()
+            # ^ diagnostic: mean squared counterfactual perturbation size
+            # for this agent this step. If lambda/k_hat trend toward 0
+            # alongside this also shrinking, that's the entropy-collapse
+            # confound (expected in pure-strategy/corner-NE regimes) --
+            # not necessarily "this isn't a potential game." If this stays
+            # roughly flat while k_hat still trends down, that's a
+            # genuine closeness signal.
 
-        log["train/k_max"] = self.k_max_tracker.k_max
+        log["train/k_max"] = self.k_max_tracker.k_max.tolist()
         log["train/entropy_coef"] = current_entropy_coef
 
         with th.no_grad():
@@ -186,5 +235,3 @@ class NPGACTrainer:
                 dim=1,
             ).squeeze(-1)
         return action.mean(dim=0).tolist()
-
-

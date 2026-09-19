@@ -35,21 +35,39 @@ def phi_td_loss(phi, td, num_agents):
 
 
 def sample_counterfactual_strategies(actors, td, num_agents):
+    """Returns (cf_strategies, deltas).
+
+    cf_strategies[i]: joint action with agent i's coordinate replaced by a
+        fresh sample a_i' ~ pi_i.
+    deltas[i]: (a_i' - a_i), the actual size of the counterfactual
+        perturbation used to produce cf_strategies[i].
+
+    deltas is new -- it's needed by closeness_and_trsut to normalize the
+    naive-loss residual by the probe size. Without it, k_hat shrinks
+    toward 0 purely because pi_i's entropy anneals down / sharpens over
+    training (a'_i -> a_i), independent of whether the underlying game is
+    actually close to a potential game: since Q_i and phi are smooth,
+    delta_Q ~= grad(Q_i)*delta_a and delta_phi ~= grad(phi)*delta_a both
+    shrink proportionally to delta_a, so their difference shrinks too even
+    when grad(phi) - grad(Q_i) hasn't gone away.
+    """
     joint_strategy = joint_strategy_from_td(td, num_agents)
     cf_strategies = []
+    deltas = []
     for i, actor in enumerate(actors):
-        obs_i = td["agents", str(i), "observation"]
         fresh_td = actor(td.select(("agents", str(i), "observation")).clone())
         a_i_prime = fresh_td["agents", str(i), "action"].squeeze(-1) # [B]
+        a_i = joint_strategy[:, i]
+        deltas.append(a_i_prime - a_i)
         cf_strategies.append(replace_agent_coord(joint_strategy, i, a_i_prime))
-    return cf_strategies
+    return cf_strategies, deltas
 
-def phi_naive_loss(phi, q_heads, actors, td, num_agents, 
-                   cf_strategies=None, detach_q=True):
+def phi_naive_loss(phi, q_heads, actors, td, num_agents,
+                   cf_strategies=None, deltas=None, detach_q=True):
 
     joint_strategy = joint_strategy_from_td(td, num_agents)
-    if cf_strategies is None:
-        cf_strategies = sample_counterfactual_strategies(actors, td, num_agents)
+    if cf_strategies is None or deltas is None:
+        cf_strategies, deltas = sample_counterfactual_strategies(actors, td, num_agents)
 
     phi_sa = phi(joint_strategy)
 
@@ -70,28 +88,106 @@ def phi_naive_loss(phi, q_heads, actors, td, num_agents,
         residuals.append(delta_phi - delta_q)
 
     residuals = th.stack(residuals, dim=0) # [N, B]
-    return th.mean(residuals ** 2), residuals
+    return th.mean(residuals ** 2), residuals, deltas
 
 class AdaptiveKMax:
-    def __init__(self, k_max_fraction=0.5, ema_decay=0.99,
-                 floor=1e-3, init=0.15):
+    """Per-agent trust-gate threshold.
+
+    The previous implementation pooled both agents into a single scalar
+    (via k_hat.mean()) and re-derived k_max every step as a fraction of
+    that same, continuously-updating quantity's own EMA:
+
+        k_max = max(k_max_fraction * EMA(k_hat.mean()), floor)
+
+    This is self-defeating: once k_hat stabilizes at ANY level v (whether
+    or not that level reflects genuine potential-game structure), the EMA
+    converges to v too, so k_max -> k_max_fraction * v. For
+    k_max_fraction < 1 this guarantees k_hat / k_max > 1 for every agent
+    whose k_hat is near its own steady value -- lambda is driven to a
+    permanent 0 as an artifact of the definition, not of game structure.
+    Pooling across agents compounds this: whichever agent's raw k_hat
+    happens to run numerically larger (for reasons unrelated to
+    potential-ness -- payoff scale, how fast its own policy sharpens)
+    permanently zeroes its own trust while also setting the bar for the
+    other agent.
+
+    This version:
+      - keeps one EMA per agent (k_hat is never pooled across agents), and
+      - only updates that EMA during an initial `calibration_steps`
+        window, then freezes it -- so k_max reflects a fixed reference
+        scale (roughly: "how much naive-loss residual did this agent show
+        early in training, before its policy had sharpened much") rather
+        than perpetually chasing k_hat's own ongoing decay or rise.
+
+    k_max_fraction now means "how many multiples of the calibrated
+    reference scale still count as trustworthy" -- with the residual
+    normalization in closeness_and_trsut (see below) k_hat should roughly
+    stabilize once Q_i/phi have converged, rather than trend to 0, so
+    values >= 1 make sense here (unlike the old self-referential design,
+    where <1 was required to ever produce nonzero lambda at all).
+    """
+
+    def __init__(self, num_agents, k_max_fraction=1.5, ema_decay=0.99,
+                 floor=1e-3, calibration_steps=200, device=None):
+        self.num_agents = num_agents
         self.k_max_fraction = k_max_fraction
         self.ema_decay = ema_decay
         self.floor = floor
-        self.ema_max = init
+        self.calibration_steps = calibration_steps
+        self.ema_ref = th.zeros(num_agents, device=device)
+        self.n_updates = 0
 
     def update(self, k_hat):
+        """k_hat: [num_agents] tensor, this step's per-agent closeness
+        estimate. Call ONCE per training step with the full vector.
+
+        Do not call this inside a `for i in range(N)` loop with
+        `k_hat[i]`: k_hat[i] is a scalar, so `(1 - ema_decay) * k_hat[i]`
+        would broadcast across the *entire* ema_ref vector on each
+        iteration, bleeding one agent's calibration into every other
+        agent's reference (re-introducing the pooling bug this class is
+        meant to remove). It would also advance self.n_updates N times per
+        real training step, silently shrinking calibration_steps by a
+        factor of N relative to what NPGACConfig says.
+        """
         with th.no_grad():
-            batch_stat = k_hat.mean().item()
-            self.ema_max = self.ema_decay * self.ema_max + (1 - self.ema_decay) * batch_stat
+            self.n_updates += 1
+            if self.n_updates <= self.calibration_steps:
+                self.ema_ref = (
+                    self.ema_decay * self.ema_ref
+                    + (1 - self.ema_decay) * k_hat.detach().to(self.ema_ref.device)
+                )
+            # after calibration_steps, ema_ref is frozen: k_max stops
+            # chasing k_hat's own live value.
 
     @property
     def k_max(self):
-        return max(self.k_max_fraction * self.ema_max, self.floor)
+        return th.clamp(self.k_max_fraction * self.ema_ref, min=self.floor)
 
-def closeness_and_trsut(residuals, k_max):
+
+def closeness_and_trsut(residuals, deltas, k_max, eps=1e-4):
+    """(k_hat, lam), both shape [N].
+
+    k_hat is now normalized by the squared counterfactual perturbation
+    size (E[(a_i' - a_i)^2]) rather than the raw residual magnitude, so it
+    estimates the actual local gradient mismatch
+    |grad_a(phi) - grad_a(Q_i)| instead of
+    (gradient mismatch) * (how far we happened to perturb) -- the latter
+    shrinks toward 0 for free as the policy's entropy anneals down over
+    training, regardless of whether the game is close to a potential game.
+    `eps` guards against blow-up when a'_i - a_i is ~0 for a batch element
+    (a very peaked policy).
+
+    residuals: [N, B] -- (delta_phi - delta_q) per agent, per batch
+        element, as returned by phi_naive_loss.
+    deltas: list of N tensors, each [B] -- (a_i' - a_i) for that agent, as
+        returned by sample_counterfactual_strategies / phi_naive_loss.
+    k_max: [N] per-agent trust threshold (AdaptiveKMax.k_max).
+    """
     with th.no_grad():
-        k_hat = th.sqrt(th.mean(residuals ** 2, dim=-1))
+        delta_sq = th.stack([d ** 2 for d in deltas], dim=0)  # [N, B]
+        normalized = residuals ** 2 / (delta_sq + eps)
+        k_hat = th.sqrt(th.mean(normalized, dim=-1))  # [N]
         lam = 1.0 - th.clamp(k_hat / k_max, 0.0, 1.0)
     return k_hat, lam
 
@@ -106,15 +202,17 @@ class ActorLossOutputs:
     entropy: th.Tensor
 
 def actor_losses(actors, q_heads, phi, td, num_agents,
-                 k_max, phi_residuals=None, entropy_coef=0.0):
+                 k_max, phi_residuals=None, phi_deltas=None, entropy_coef=0.0):
     joint_strategy = joint_strategy_from_td(td, num_agents)
 
-    if phi_residuals is None:
-        _, phi_residuals = phi_naive_loss(phi, q_heads, actors, td, num_agents)
+    if phi_residuals is None or phi_deltas is None:
+        _, phi_residuals, phi_deltas = phi_naive_loss(
+            phi, q_heads, actors, td, num_agents
+        )
 
-    k_hat, lam = closeness_and_trsut(phi_residuals, k_max)
+    k_hat, lam = closeness_and_trsut(phi_residuals, phi_deltas, k_max)
 
-    cf_strategies = sample_counterfactual_strategies(actors, td, num_agents)
+    cf_strategies, _ = sample_counterfactual_strategies(actors, td, num_agents)
 
     per_agent_loss = []
     entropies = []
@@ -145,4 +243,3 @@ def actor_losses(actors, q_heads, phi, td, num_agents,
         per_agent_loss=per_agent_loss, lam=lam,
         k_hat=k_hat, entropy=th.stack(entropies),
     )
-
