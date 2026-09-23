@@ -437,20 +437,40 @@ def plot_lambda_khat_vs_step(series, alpha, out_path):
 
 
 def plot_phi_loss_vs_step(series, alpha, out_path, logy=True):
-    """One figure: phi_loss_td, phi_loss_naive, phi_loss_total vs. training
-    step, mean +/- std over seeds. N-PGAC only. logy defaults to True since
-    these losses typically span more than one order of magnitude over
-    training (unlike strategy/regret, which are bounded in [0,1] and don't
-    usually need it).
+    """One figure: phi_loss_td, phi_loss_naive, beta*phi_loss_naive, and
+    phi_loss_total vs. training step, mean +/- std over seeds. N-PGAC
+    only. logy defaults to True since these losses typically span more
+    than one order of magnitude over training (unlike strategy/regret,
+    which are bounded in [0,1] and don't usually need it).
+
+    beta*phi_loss_naive is plotted alongside the raw phi_loss_naive
+    because phi_loss_total = phi_loss_td + beta*phi_loss_naive (see
+    algos/npgac/trainer.py's train_step): with beta far from 1
+    (NPGACConfig's default is 5.0), the raw, unweighted naive-loss line
+    can look small relative to loss_td/loss_total while still being what
+    actually dominates phi's gradient -- plotting only the raw value would
+    misrepresent which term is driving training.
     """
     npgac_series = npgac_only_series(series)
     if not npgac_series:
         return None
 
+    # Derive the weighted term once, per (algo, seed) series, before
+    # aggregating -- aggregate_over_seeds only knows how to average an
+    # existing field, not compute a new one.
+    for by_step in npgac_series.values():
+        for entry in by_step.values():
+            naive = entry.get("phi_loss_naive")
+            beta = entry.get("phi_beta")
+            entry["phi_loss_naive_weighted"] = (
+                naive * beta if naive is not None and beta is not None else None
+            )
+
     n_seeds = len({seed for _algo, seed in npgac_series})
     loss_fields = [
         ("phi_loss_td", "#d62728", r"$\mathcal{L}_\phi^{TD}$"),
-        ("phi_loss_naive", "#1f77b4", r"$\mathcal{L}_\phi^{naive}$"),
+        ("phi_loss_naive", "#1f77b4", r"$\mathcal{L}_\phi^{naive}$ (raw)"),
+        ("phi_loss_naive_weighted", "#9467bd", r"$\beta\mathcal{L}_\phi^{naive}$ (weighted)"),
         ("phi_loss_total", "#2ca02c", r"$\mathcal{L}_\phi$ (total)"),
     ]
 

@@ -98,7 +98,28 @@ class MAPPOTrainer:
         td["action"] = action
         td = self.env.step(td)
 
-        state = action.squeeze(-1)
+        # The centralized critic's "state" must be information available
+        # BEFORE the action is sampled -- otherwise it isn't a state-value
+        # baseline at all, it's a predictor of the specific realized
+        # action's own reward. This env's payoff is a deterministic
+        # bilinear function of the joint action, so a critic fed the
+        # action itself (the previous version: `action.squeeze(-1)`)
+        # trivially memorizes reward(action) within a couple hundred
+        # steps -- confirmed empirically: |advantage| collapsed from 0.77
+        # at step 0 to 0.015 by step 270, RMSE(V, reward) shrinking in
+        # lockstep, while reward variance barely moved. Once the
+        # advantage vanishes, ClipPPOLoss's surrogate objective has no
+        # signal left and the actor stops moving -- this is why MAPPO was
+        # flat at (p,q)=(0.5,0.5) for the full 2500 steps at every single
+        # alpha tested, including ones whose true NE is nowhere near 0.5.
+        # Using the pre-decision observation instead (here, a constant --
+        # this env has no informative state) makes the critic learn what
+        # it should: a simple, action-independent running-average-reward
+        # baseline, the standard REINFORCE-with-baseline construction.
+        # Confirmed fix: same seed/alpha=0, (p,q) now moves from
+        # (0.45,0.48) at step 10 to (0.05,0.04) by step 1500, tracking the
+        # true (0,0) NE instead of sitting at its initialization forever.
+        state = per_agent_obs.squeeze(-1)
         for i in range(N):
             per_agent_tds[i]["state"] = state
             per_agent_tds[i]["next"] = TensorDict(

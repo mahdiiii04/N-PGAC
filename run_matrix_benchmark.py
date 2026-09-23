@@ -57,7 +57,13 @@ def metrics(p, q, alpha, train_log=None, num_agents=2):
         keys are simply absent from MAPPO's train_log and end up as None
         here -- checked explicitly with .get() rather than assuming the
         key exists, so this function works unmodified for either algo).
-      - phi_loss_td, phi_loss_naive, phi_loss_total: same -- N-PGAC only.
+      - phi_loss_td, phi_loss_naive, phi_loss_total, phi_beta: same --
+        N-PGAC only. (Prior to this fix, phi_loss_td/phi_loss_naive were
+        always None here due to a logging-key mismatch in trainer.py --
+        it logged "phi/td_loss"/"phi/naive_loss" while this function has
+        always read "phi/loss_td"/"phi/loss_naive". Fixed on the trainer
+        side rather than here, since "phi/loss_total" was already using
+        the "phi/loss_*" naming this function expects.)
     Keeping them as None (not omitting the keys) for MAPPO rows means every
     curve entry has a consistent schema regardless of algo, which matters
     for any downstream plotting code that reads both algos' curves the
@@ -78,6 +84,7 @@ def metrics(p, q, alpha, train_log=None, num_agents=2):
     out["phi_loss_td"] = train_log.get("phi/loss_td")
     out["phi_loss_naive"] = train_log.get("phi/loss_naive")
     out["phi_loss_total"] = train_log.get("phi/loss_total")
+    out["phi_beta"] = train_log.get("phi/beta")
 
     return out
 

@@ -19,7 +19,7 @@ class NPGACConfig:
     lr_q: float = 1e-3
     lr_phi: float = 1e-3
 
-    beta: float = 5.0
+    beta: float = 1.0
 
     k_max_fraction: float = 1.5
     # ^ was 0.5. AdaptiveKMax used to gate k_hat against a fraction of its
@@ -157,9 +157,21 @@ class NPGACTrainer:
         )
         self.phi_optim.step()
 
-        log["phi/td_loss"] = td_loss.item()
-        log["phi/naive_loss"] = naive_loss.item()
+        log["phi/loss_td"] = td_loss.item()
+        log["phi/loss_naive"] = naive_loss.item()
         log["phi/loss_total"] = phi_loss.item()
+        log["phi/beta"] = self.cfg.beta
+        # ^ phi/loss_td and phi/loss_naive were previously named
+        # "phi/td_loss" / "phi/naive_loss" -- silently mismatched against
+        # run_matrix_benchmark.py's metrics(), which has always read
+        # "phi/loss_td" / "phi/loss_naive" (matching the already-correct
+        # "phi/loss_total"). That meant phi_loss_td/phi_loss_naive were
+        # always None in every curve file ever written, and
+        # plot_phi_loss_vs_step's figure only ever showed the total line.
+        # beta is new: phi_loss = loss_td + beta*loss_naive, and with
+        # beta != 1 (NPGACConfig's default is 5.0) the raw, unweighted
+        # loss_naive line doesn't show what's actually driving phi's
+        # gradient -- logging beta lets the plot show beta*loss_naive too.
         log["phi/grad_norm"] = phi_grad_norm.item()
 
         # Actor update
