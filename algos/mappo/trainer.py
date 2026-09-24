@@ -11,7 +11,7 @@ from algos.mappo.networks import CentralizedValueNet, make_actor
 @dataclass
 class MAPPOConfig:
     num_agents: int = 2
-    lr_actor: float = 1e-3
+    lr_actor: float = 1e-4
     lr_critic: float = 1e-3
     clip_epsilon: float = 0.2
 

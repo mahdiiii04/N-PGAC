@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 import torch as th
 
@@ -11,6 +12,7 @@ from algos.npgac.losses import (
     q_regression_loss,
 )
 from algos.npgac.networks import JointQHead, Phi, make_actor
+from algos.npgac.replay import ReplayBuffer, make_target, soft_update
 
 @dataclass
 class NPGACConfig:
@@ -19,7 +21,7 @@ class NPGACConfig:
     lr_q: float = 1e-3
     lr_phi: float = 1e-3
 
-    beta: float = 1.0
+    beta: float = 5.0
 
     k_max_fraction: float = 1.5
     # ^ was 0.5. AdaptiveKMax used to gate k_hat against a fraction of its
@@ -61,6 +63,28 @@ class NPGACConfig:
     hidden_size: int = 32
     batch_size: int = 512
 
+    replay_capacity: int = 50_000
+    # ^ new (Tier 1). In transitions, not batches -- with the env's usual
+    # batch_size=512/step, ~100 steps of history. q_regression_loss's and
+    # phi_td_loss's targets are deterministic functions of the joint
+    # action alone in this env (no bootstrapping, no real state), so
+    # replaying old transitions for THESE two losses introduces no
+    # off-policy bias -- see replay.py's ReplayBuffer docstring for why
+    # phi_naive_loss is deliberately excluded from this.
+    critic_batch_size: Optional[int] = None
+    # ^ new. Batch size sampled from replay for Q_i/phi's regression
+    # updates. None -> match whatever collect() just returned (this env's
+    # per-step batch already exceeds most reasonable settings here, so the
+    # buffer is usably full from the very first push -- no warmup period
+    # needed the way sample-starved online RL usually requires).
+    tau: float = 0.01
+    # ^ new (Tier 1). Polyak coefficient for the Q_i/phi target networks
+    # used by the actor and the trust gate (see replay.py's soft_update
+    # docstring for why target networks are needed here despite this env
+    # having no bootstrapping to stabilize: it's about decoupling the
+    # actor/k_hat's read of Q_i/phi from the same-step live update that
+    # just moved them, not about a self-referential TD target).
+
     def entropy_coef(self, step):
         """Linear anneal from entropy_start to entropy_end over
         entropy_anneal_steps, then held at entropy_end.
@@ -88,6 +112,19 @@ class NPGACTrainer:
         ]
 
         self.phi = Phi(num_agents=N, hidden_size=self.cfg.hidden_size).to(self.device)
+
+        # Tier 1: frozen target copies of Q_i/phi. Used wherever the actor
+        # or the trust gate READS Q_i/phi (advantage terms, k_hat) instead
+        # of the live, currently-training copies -- see soft_update's
+        # docstring in replay.py for why. Q_i's/phi's OWN training
+        # objective keeps using the live networks (there's no
+        # self-referential target to stabilize there, see below).
+        self.q_heads_target = [make_target(q) for q in self.q_heads]
+        self.phi_target = make_target(self.phi)
+
+        self.replay_buffer = ReplayBuffer(
+            capacity=self.cfg.replay_capacity, num_agents=N, device=self.device,
+        )
 
         self.actor_optims = [
             th.optim.Adam(a.parameters(), lr=self.cfg.lr_actor) for a in self.actors
@@ -130,8 +167,20 @@ class NPGACTrainer:
         N = self.cfg.num_agents
         log = {}
 
-        # Q_i update
-        q_loss, per_agent_q_loss = q_regression_loss(self.q_heads, td, N)
+        # Tier 1: store the fresh batch, then sample a (possibly larger,
+        # temporally broader) batch from replay for Q_i/phi's regression
+        # training specifically. See replay.py's ReplayBuffer docstring:
+        # this is unbiased for these two losses in this env, and directly
+        # targets the "conditioned on an ever-narrowing on-policy sliver"
+        # problem -- Q_i/phi now keep seeing the wider action-space
+        # coverage from earlier, higher-entropy training even after the
+        # policy has sharpened.
+        self.replay_buffer.push(td)
+        critic_batch_size = self.cfg.critic_batch_size or td.batch_size[0]
+        critic_td = self.replay_buffer.sample(critic_batch_size)
+
+        # Q_i update -- replay-sampled
+        q_loss, per_agent_q_loss = q_regression_loss(self.q_heads, critic_td, N)
         for i in range(N):
             self.q_optims[i].zero_grad()
             per_agent_q_loss[i].backward(retain_graph=True)
@@ -143,10 +192,22 @@ class NPGACTrainer:
             log[f"q/{i}/grad_norm"] = grad_norm.item()
         log[f"q/loss_mean"] = q_loss.item()
 
-        # Phi update
-        td_loss = phi_td_loss(self.phi, td, N)
+        # Phi update. td_loss is replay-sampled (same unbiased-target
+        # argument as Q_i, above). naive_loss stays on the FRESH,
+        # on-policy td -- pairing a replayed (possibly old, wide-entropy)
+        # base action with a freshly-resampled counterfactual from the
+        # CURRENT policy would produce a perturbation size that doesn't
+        # correspond to any single point in training, which is exactly
+        # the kind of muddying we don't want feeding into phi's own naive-
+        # loss term (see ReplayBuffer's docstring for the fuller
+        # reasoning). It reads the TARGET q_heads rather than the live
+        # ones -- consistent with training phi against the same stable
+        # reference frame it (via phi_target) will later be evaluated
+        # against for the actor/k_hat computation, rather than whatever
+        # q_heads happened to be mid-update to this exact step.
+        td_loss = phi_td_loss(self.phi, critic_td, N)
         naive_loss, phi_residuals, phi_deltas = phi_naive_loss(
-            self.phi, self.q_heads, self.actors, td, N
+            self.phi, self.q_heads_target, self.actors, td, N
         )
         phi_loss = td_loss + self.cfg.beta * naive_loss
 
@@ -161,23 +222,23 @@ class NPGACTrainer:
         log["phi/loss_naive"] = naive_loss.item()
         log["phi/loss_total"] = phi_loss.item()
         log["phi/beta"] = self.cfg.beta
-        # ^ phi/loss_td and phi/loss_naive were previously named
-        # "phi/td_loss" / "phi/naive_loss" -- silently mismatched against
-        # run_matrix_benchmark.py's metrics(), which has always read
-        # "phi/loss_td" / "phi/loss_naive" (matching the already-correct
-        # "phi/loss_total"). That meant phi_loss_td/phi_loss_naive were
-        # always None in every curve file ever written, and
-        # plot_phi_loss_vs_step's figure only ever showed the total line.
-        # beta is new: phi_loss = loss_td + beta*loss_naive, and with
-        # beta != 1 (NPGACConfig's default is 5.0) the raw, unweighted
-        # loss_naive line doesn't show what's actually driving phi's
-        # gradient -- logging beta lets the plot show beta*loss_naive too.
         log["phi/grad_norm"] = phi_grad_norm.item()
+        log["replay/size"] = len(self.replay_buffer)
 
-        # Actor update
+        # Tier 1: Polyak-update the target networks now that the live
+        # ones have just taken their gradient step this round, then use
+        # ONLY the targets for everything the actor/trust gate reads
+        # below -- decouples that signal from parameters that moved this
+        # exact step (see soft_update's docstring in replay.py).
+        for i in range(N):
+            soft_update(self.q_heads_target[i], self.q_heads[i], self.cfg.tau)
+        soft_update(self.phi_target, self.phi, self.cfg.tau)
+
+        # Actor update -- fresh on-policy td throughout (unchanged from
+        # before Tier 1), now reading the TARGET phi/Q_i instead of live.
         with th.no_grad():
             _, fresh_residuals, fresh_deltas = phi_naive_loss(
-                self.phi, self.q_heads, self.actors, td, N
+                self.phi_target, self.q_heads_target, self.actors, td, N
             )
 
         k_hat_now, _ = closeness_and_trsut(
@@ -193,7 +254,8 @@ class NPGACTrainer:
 
         current_entropy_coef = self.cfg.entropy_coef(self.num_updates)
         actor_out = actor_losses(
-            self.actors, self.q_heads, self.phi, td, N, self.k_max_tracker.k_max,
+            self.actors, self.q_heads_target, self.phi_target, td, N,
+            self.k_max_tracker.k_max,
             phi_residuals=fresh_residuals, phi_deltas=fresh_deltas,
             entropy_coef=current_entropy_coef,
         )
